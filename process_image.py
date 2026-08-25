@@ -9,189 +9,299 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 import numpy as np
 from PIL import Image
 
-DEFAULT_LAYOUT = {"top": 20, "left": 12, "right": 12, "bottom": 20}
+ZONE_SIZE = 100
 
-# Track the previous frame's output so automatic temporal smoothing can work
-# across sequential calls when the same script is used to process a video stream.
-_LAST_FRAME_COLORS: Dict[str, List[Tuple[float, float, float]]] | None = None
+def output_image(image: np.ndarray, output_path: str) -> None:
+    """Save the processed image to the specified output path."""
+    output_image = Image.fromarray(image)
+    output_image.save(output_path)
+    print(f"Saved processed image to {output_path}")
 
+def draw_square_on_image(image: np.ndarray, top_left: Tuple[int, int], bottom_right: Tuple[int, int], color: Tuple[int, int, int]) -> None:
+    """Fill the square on the image for visualization."""
+    x0, y0 = top_left
+    x1, y1 = bottom_right
 
-def _rgb_to_hsv(arr: np.ndarray) -> np.ndarray:
-    rgb = arr.astype(np.float32) / 255.0
-    hsv = np.zeros_like(rgb, dtype=np.float32)
-    r, g, b = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
-
-    max_channel = np.maximum(np.maximum(r, g), b)
-    min_channel = np.minimum(np.minimum(r, g), b)
-    delta = max_channel - min_channel
-
-    hue = np.zeros_like(max_channel)
-    mask = delta > 1e-6
-    r_mask = mask & (max_channel == r)
-    g_mask = mask & (max_channel == g)
-    b_mask = mask & (max_channel == b)
-
-    hue[r_mask] = ((g[r_mask] - b[r_mask]) / delta[r_mask]) % 6.0
-    hue[g_mask] = ((b[g_mask] - r[g_mask]) / delta[g_mask]) + 2.0
-    hue[b_mask] = ((r[b_mask] - g[b_mask]) / delta[b_mask]) + 4.0
-    hue *= 60.0
-
-    saturation = np.zeros_like(max_channel)
-    non_zero = max_channel > 1e-6
-    saturation[non_zero] = delta[non_zero] / max_channel[non_zero]
-
-    value = max_channel
-    hsv[:, :, 0] = hue
-    hsv[:, :, 1] = saturation
-    hsv[:, :, 2] = value
-    return hsv
-
-
-def _detect_content_bounds(image: np.ndarray) -> Tuple[int, int, int, int]:
-    """Ignore black bars (letterboxing/pillarboxing) when sampling the edge zones."""
-    grayscale = np.mean(image, axis=2)
-    mask = grayscale > 16
-    if not np.any(mask):
-        height, width = image.shape[:2]
-        return 0, 0, width, height
-
-    ys, xs = np.where(mask)
-    x0, x1 = int(xs.min()), int(xs.max()) + 1
-    y0, y1 = int(ys.min()), int(ys.max()) + 1
-    return x0, y0, x1, y1
-
-
-def _sample_region_mean(rgb: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> Tuple[float, float, float]:
-    crop = rgb[y0:y1, x0:x1]
-    if crop.size == 0:
-        return (0.0, 0.0, 0.0)
-
-    hsv = _rgb_to_hsv(crop)
-    value = hsv[:, :, 2]
-    saturation = hsv[:, :, 1]
-    valid_mask = (value >= 0.08) & (saturation >= 0.07)
-
-    if valid_mask.any():
-        sampled = crop[valid_mask]
-    else:
-        sampled = crop.reshape(-1, 3)
-
-    average = sampled.mean(axis=0)
-    return tuple(float(channel) for channel in average)
-
-
-def _apply_gamma(rgb_triplet: Sequence[float], gamma: float = 2.2) -> Tuple[float, float, float]:
-    corrected = np.clip(np.power(np.clip(np.asarray(rgb_triplet, dtype=np.float32), 0.0, 1.0), 1.0 / gamma), 0.0, 1.0)
-    return tuple(float(channel) for channel in corrected)
-
-
-def _smooth_with_previous(current: Sequence[float], previous: Sequence[float] | None, alpha: float = 0.35) -> Tuple[float, float, float]:
-    if previous is None:
-        return tuple(float(channel) for channel in current)
-    prev = np.asarray(previous, dtype=np.float32)
-    curr = np.asarray(current, dtype=np.float32)
-    blended = alpha * curr + (1.0 - alpha) * prev
-    return tuple(float(channel) for channel in blended)
-
-
-def _build_zone_layout(width: int, height: int, layout: Dict[str, int]) -> Dict[str, List[Tuple[int, int, int, int]]]:
-    x0, y0, x1, y1 = 0, 0, width, height
-    inset = 0.08
-    top_band = max(1, int(height * inset))
-    bottom_band = max(1, int(height * inset))
-    left_band = max(1, int(width * inset))
-    right_band = max(1, int(width * inset))
-
-    zones: Dict[str, List[Tuple[int, int, int, int]]] = {"top": [], "left": [], "right": [], "bottom": []}
-
-    top_count = max(1, layout.get("top", DEFAULT_LAYOUT["top"]))
-    left_count = max(1, layout.get("left", DEFAULT_LAYOUT["left"]))
-    right_count = max(1, layout.get("right", DEFAULT_LAYOUT["right"]))
-    bottom_count = max(1, layout.get("bottom", DEFAULT_LAYOUT["bottom"]))
-
-    for idx in range(top_count):
-        zone_x0 = x0 + idx * width // top_count
-        zone_x1 = x0 + (idx + 1) * width // top_count
-        zones["top"].append((zone_x0, y0, zone_x1, y0 + top_band))
-
-    for idx in range(left_count):
-        zone_y0 = y0 + idx * (height - top_band - bottom_band) // left_count
-        zone_y1 = y0 + (idx + 1) * (height - top_band - bottom_band) // left_count
-        zones["left"].append((x0, zone_y0, x0 + left_band, zone_y1))
-
-    for idx in range(right_count):
-        zone_y0 = y0 + idx * (height - top_band - bottom_band) // right_count
-        zone_y1 = y0 + (idx + 1) * (height - top_band - bottom_band) // right_count
-        zones["right"].append((x1 - right_band, zone_y0, x1, zone_y1))
-
-    for idx in range(bottom_count):
-        zone_x0 = x0 + idx * width // bottom_count
-        zone_x1 = x0 + (idx + 1) * width // bottom_count
-        zones["bottom"].append((zone_x0, y1 - bottom_band, zone_x1, y1))
-
-    return zones
-
-
-def _compute_zone_colors(image: np.ndarray, layout: Dict[str, int]) -> Dict[str, List[Tuple[float, float, float]]]:
     height, width = image.shape[:2]
-    x0, y0, x1, y1 = _detect_content_bounds(image)
-    content_width = max(1, x1 - x0)
-    content_height = max(1, y1 - y0)
+    x0 = max(0, min(x0, width - 1))
+    y0 = max(0, min(y0, height - 1))
+    x1 = max(x0 + 1, min(x1, width))
+    y1 = max(y0 + 1, min(y1, height))
 
-    if x0 > 0 or y0 > 0 or x1 < width or y1 < height:
-        crop = image[y0:y1, x0:x1]
-    else:
-        crop = image
+    image[y0:y1, x0:x1] = color
 
-    full_w, full_h = crop.shape[1], crop.shape[0]
-    zones = _build_zone_layout(full_w, full_h, layout)
+    # print(f"Drawing filled square from {top_left} to {bottom_right} with color {color}")
 
-    result: Dict[str, List[Tuple[float, float, float]]] = {"top": [], "left": [], "right": [], "bottom": []}
-    for key in ("top", "left", "right", "bottom"):
-        for zone in zones[key]:
-            zone_x0, zone_y0, zone_x1, zone_y1 = zone
-            zone_color = _sample_region_mean(crop, zone_x0, zone_y0, zone_x1, zone_y1)
-            zone_color = _apply_gamma(zone_color)
-            result[key].append(zone_color)
+def draw_square_outline_on_image(image: np.ndarray, top_left: Tuple[int, int], bottom_right: Tuple[int, int], color: Tuple[int, int, int]) -> None:
+    """Draw only the border of a square on the image for visualization."""
+    x0, y0 = top_left
+    x1, y1 = bottom_right
 
-    return result
+    height, width = image.shape[:2]
+    x0 = max(0, min(x0, width - 1))
+    y0 = max(0, min(y0, height - 1))
+    x1 = max(x0 + 1, min(x1, width))
+    y1 = max(y0 + 1, min(y1, height))
 
+    image[y0:y1, x0] = color
+    image[y0:y1, x1 - 1] = color
+    image[y0, x0:x1] = color
+    image[y1 - 1, x0:x1] = color
 
-def _smooth_zone_colors(zone_colors: Dict[str, List[Tuple[float, float, float]]]) -> Dict[str, List[Tuple[float, float, float]]]:
-    global _LAST_FRAME_COLORS
-    smoothed: Dict[str, List[Tuple[float, float, float]]] = {"top": [], "left": [], "right": [], "bottom": []}
+    # print(f"Drawing square border from {top_left} to {bottom_right} with color {color}")
 
-    for key in ("top", "left", "right", "bottom"):
-        prev_key = _LAST_FRAME_COLORS.get(key, []) if _LAST_FRAME_COLORS else []
-        for idx, rgb in enumerate(zone_colors[key]):
-            previous = prev_key[idx] if idx < len(prev_key) else None
-            smoothed[key].append(_smooth_with_previous(rgb, previous, alpha=0.35))
+def extract_from_array(image: np.ndarray, top_left: Tuple[int, int], bottom_right: Tuple[int, int]) -> np.ndarray:
+    """Extract a sub-array from the image based on the specified coordinates."""
+    x0, y0 = top_left
+    x1, y1 = bottom_right
 
-    _LAST_FRAME_COLORS = smoothed
-    return smoothed
+    height, width = image.shape[:2]
+    x0 = max(0, min(x0, width - 1))
+    y0 = max(0, min(y0, height - 1))
+    x1 = max(x0 + 1, min(x1, width))
+    y1 = max(y0 + 1, min(y1, height))
 
+    extracted_array = image[y0:y1, x0:x1]
+    # print(f"Extracted array from {top_left} to {bottom_right}, shape: {extracted_array.shape}")
+    return extracted_array
 
-def _save_zone_preview(output_path: Path, image: np.ndarray, zone_colors: Dict[str, List[Tuple[float, float, float]]], layout: Dict[str, int]) -> None:
-    preview = np.array(image, copy=True)
-    h, w = preview.shape[:2]
-    x0, y0, x1, y1 = _detect_content_bounds(preview)
-    content = preview[y0:y1, x0:x1]
-    full_w, full_h = content.shape[1], content.shape[0]
-    zones = _build_zone_layout(full_w, full_h, layout)
+def get_zone_arrays(image: np.ndarray, num_x_zones: int, num_y_zones: int) -> Dict[str, List[np.ndarray]]:
+    """Get the zone arrays for the LED strip layout."""
+    height, width = image.shape[:2]
+    zone_arrays = {
+        "top_left_corner": [],
+        "top_right_corner": [],
+        "bottom_left_corner": [],
+        "bottom_right_corner": [],
+        "top_row": [],
+        "bottom_row": [],
+        "left_column": [],
+        "right_column": []
+    }
 
-    for key in ("top", "left", "right", "bottom"):
-        for idx, zone in enumerate(zones[key]):
-            zone_x0, zone_y0, zone_x1, zone_y1 = zone
-            zone_x0 += x0
-            zone_y0 += y0
-            zone_x1 += x0
-            zone_y1 += y0
-            rgb = np.asarray(zone_colors[key][idx], dtype=np.float32) * 255.0
-            preview[zone_y0:zone_y1, zone_x0:zone_x1] = rgb
+    # height, width = image.shape[:2]
+    # image = np.array(image, copy=True)
 
-    out_img = Image.fromarray(preview.astype(np.uint8), mode="RGB")
-    out_img.save(output_path)
+    horizontal_zone_height = ZONE_SIZE
+    horizontal_zone_width = ZONE_SIZE
+    vertical_zone_height = ZONE_SIZE
+    vertical_zone_width = ZONE_SIZE
 
+    corner_height = ZONE_SIZE + (height % ZONE_SIZE // 2)
+    corner_width = ZONE_SIZE + (width % ZONE_SIZE // 2)
+
+    # print(f"Image dimensions: {width}x{height}")
+    # print(f"Horizontal zone height: {horizontal_zone_height}, Horizontal zone width: {horizontal_zone_width}")
+    # print(f"Vertical zone height: {vertical_zone_height}, Vertical zone width: {vertical_zone_width}")
+    # print(f"Corner height: {corner_height}, Corner width: {corner_width}")
+
+    top_row = max(1, num_x_zones)
+    bottom_row = max(1, num_x_zones)
+    left_column = max(1, num_y_zones)
+    right_column = max(1, num_y_zones)
+
+    # Draw corner zones
+    zone_arrays["top_left_corner"].append(extract_from_array(image, (0, 0), (corner_width, corner_height)))  # Top-left corner
+    zone_arrays["top_right_corner"].append(extract_from_array(image, (width - corner_width, 0), (width, corner_height)))  # Top-right corner
+    zone_arrays["bottom_left_corner"].append(extract_from_array(image, (0, height - corner_height), (corner_width, height)))  # Bottom-left corner
+    zone_arrays["bottom_right_corner"].append(extract_from_array(image, (width - corner_width, height - corner_height), (width, height)))  # Bottom-right corner
+
+    for i in range(top_row):
+        x0 = corner_width + (i * horizontal_zone_width)
+        x1 = min(corner_width + ((i + 1) * horizontal_zone_width), width)
+        # print(f"Drawing top zone {i}: from ({x0}, 0) to ({x1}, {horizontal_zone_height})")
+        zone_arrays["top_row"].append(extract_from_array(image, (x0, 0), (x1, horizontal_zone_height)))
+
+    for i in range(bottom_row):
+        x0 = corner_width + (i * horizontal_zone_width)
+        x1 = min(corner_width + ((i + 1) * horizontal_zone_width), width)
+        zone_arrays["bottom_row"].append(extract_from_array(image, (x0, height - horizontal_zone_height), (x1, height)))
+
+    for i in range(left_column):
+        y0 = corner_height + (i * vertical_zone_height)
+        y1 = min(corner_height + ((i + 1) * vertical_zone_height), height)
+        zone_arrays["left_column"].append(extract_from_array(image, (0, y0), (horizontal_zone_width, y1)))
+
+    for i in range(right_column):
+        y0 = corner_height + (i * vertical_zone_height)
+        y1 = min(corner_height + ((i + 1) * vertical_zone_height), height)
+        zone_arrays["right_column"].append(extract_from_array(image, (width - vertical_zone_width, y0), (width, y1)))
+
+    return zone_arrays
+
+def draw_zones_on_image(image: np.ndarray, num_x_zones: int, num_y_zones: int) -> np.ndarray:
+    """Draw only the border zones for the LED strip layout."""
+    height, width = image.shape[:2]
+    image = np.array(image, copy=True)
+
+    horizontal_zone_height = ZONE_SIZE
+    horizontal_zone_width = ZONE_SIZE
+    vertical_zone_height = ZONE_SIZE
+    vertical_zone_width = ZONE_SIZE
+
+    corner_height = ZONE_SIZE + (height % ZONE_SIZE // 2)
+    corner_width = ZONE_SIZE + (width % ZONE_SIZE // 2)
+
+    top_row = max(1, num_x_zones)
+    bottom_row = max(1, num_x_zones)
+    left_column = max(1, num_y_zones)
+    right_column = max(1, num_y_zones)
+
+    # Draw corner zones
+    draw_square_on_image(image, (0, 0), (corner_width, corner_height), (255, 255, 255))  # Top-left corner
+    draw_square_on_image(image, (width - corner_width, 0), (width, corner_height), (255, 255, 255))  # Top-right corner
+    draw_square_on_image(image, (0, height - corner_height), (corner_width, height), (255, 255, 255))  # Bottom-left corner
+    draw_square_on_image(image, (width - corner_width, height - corner_height), (width, height), (255, 255, 255))  # Bottom-right corner
+
+    for i in range(top_row):
+        x0 = corner_width + (i * horizontal_zone_width)
+        x1 = min(corner_width + ((i + 1) * horizontal_zone_width), width)
+        # print(f"Drawing top zone {i}: from ({x0}, 0) to ({x1}, {horizontal_zone_height})")
+        draw_square_on_image(image, (x0, 0), (x1, horizontal_zone_height), (255, 255, 255))
+
+    for i in range(bottom_row):
+        x0 = corner_width + (i * horizontal_zone_width)
+        x1 = min(corner_width + ((i + 1) * horizontal_zone_width), width)
+        draw_square_on_image(image, (x0, height - horizontal_zone_height), (x1, height), (255, 255, 255))
+
+    for i in range(left_column):
+        y0 = corner_height + (i * vertical_zone_height)
+        y1 = min(corner_height + ((i + 1) * vertical_zone_height), height)
+        draw_square_on_image(image, (0, y0), (horizontal_zone_width, y1), (255, 255, 255))
+
+    for i in range(right_column):
+        y0 = corner_height + (i * vertical_zone_height)
+        y1 = min(corner_height + ((i + 1) * vertical_zone_height), height)
+        draw_square_on_image(image, (width - vertical_zone_width, y0), (width, y1), (255, 255, 255))
+
+    return image
+
+def draw_outline_zones_on_image(image: np.ndarray, num_x_zones: int, num_y_zones: int) -> np.ndarray:
+    """Draw only the border zones for the LED strip layout."""
+    height, width = image.shape[:2]
+    image = np.array(image, copy=True)
+
+    horizontal_zone_height = ZONE_SIZE
+    horizontal_zone_width = ZONE_SIZE
+    vertical_zone_height = ZONE_SIZE
+    vertical_zone_width = ZONE_SIZE
+
+    corner_height = ZONE_SIZE + (height % ZONE_SIZE // 2)
+    corner_width = ZONE_SIZE + (width % ZONE_SIZE // 2)
+
+    top_row = max(1, num_x_zones)
+    bottom_row = max(1, num_x_zones)
+    left_column = max(1, num_y_zones)
+    right_column = max(1, num_y_zones)
+
+    # Draw corner zones
+    draw_square_outline_on_image(image, (0, 0), (corner_width, corner_height), (255, 255, 255))  # Top-left corner
+    draw_square_outline_on_image(image, (width - corner_width, 0), (width, corner_height), (255, 255, 255))  # Top-right corner
+    draw_square_outline_on_image(image, (0, height - corner_height), (corner_width, height), (255, 255, 255))  # Bottom-left corner
+    draw_square_outline_on_image(image, (width - corner_width, height - corner_height), (width, height), (255, 255, 255))  # Bottom-right corner
+
+    for i in range(top_row):
+        x0 = corner_width + (i * horizontal_zone_width)
+        x1 = min(corner_width + ((i + 1) * horizontal_zone_width), width)
+        # print(f"Drawing top zone {i}: from ({x0}, 0) to ({x1}, {horizontal_zone_height})")
+        draw_square_outline_on_image(image, (x0, 0), (x1, horizontal_zone_height), (255, 255, 255))
+
+    for i in range(bottom_row):
+        x0 = corner_width + (i * horizontal_zone_width)
+        x1 = min(corner_width + ((i + 1) * horizontal_zone_width), width)
+        draw_square_outline_on_image(image, (x0, height - horizontal_zone_height), (x1, height), (255, 255, 255))
+
+    for i in range(left_column):
+        y0 = corner_height + (i * vertical_zone_height)
+        y1 = min(corner_height + ((i + 1) * vertical_zone_height), height)
+        draw_square_outline_on_image(image, (0, y0), (horizontal_zone_width, y1), (255, 255, 255))
+
+    for i in range(right_column):
+        y0 = corner_height + (i * vertical_zone_height)
+        y1 = min(corner_height + ((i + 1) * vertical_zone_height), height)
+        draw_square_outline_on_image(image, (width - vertical_zone_width, y0), (width, y1), (255, 255, 255))
+
+    return image
+
+def get_image_dimensions(image_path: str) -> Tuple[int, int]:
+    """Get the dimensions (width, height) of an image."""
+    with Image.open(image_path) as img:
+        return img.size  # Returns (width, height)
+
+def get_zones(rgb_array: np.ndarray):
+    """Get the zone colors for an image without saving a preview."""
+    # image = Image.open(image_path).convert("RGB")
+    # rgb_array = np.asarray(image)
+    # zone_colors = _compute_zone_colors(rgb_array, layout)
+    # zone_colors = _smooth_zone_colors(zone_colors)
+    # return zone_colors
+
+    num_x_zones = (rgb_array.shape[1] - 2 * ZONE_SIZE) // ZONE_SIZE  # Example: 20 pixels per zone
+    num_y_zones = (rgb_array.shape[0] - 2 * ZONE_SIZE) // ZONE_SIZE  # Example: 20 pixels per zone
+    # zone_image = draw_zones_on_image(rgb_array, num_x_zones, num_y_zones)
+    # output_image(zone_image, "images/output/zone_preview.png")
+
+def output_zones(zones: Dict[str, List[Tuple[int, int, int]]], output_dir: str) -> None:
+    """Output the zone colors to separate image files for visualization."""
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    for zone_name, zone_colors in zones.items():
+        for idx, zone_color in enumerate(zone_colors):
+            # Create a simple image with the zone color
+            zone_image = Image.new("RGB", (ZONE_SIZE, ZONE_SIZE), zone_color)
+            zone_image.save(output_path / f"{zone_name}_{idx}.png")
+
+def compute_average_zone_color(zone_array: np.ndarray) -> Tuple[int, int, int]:
+    """Compute the average color of a zone array."""
+    avg_color = np.mean(zone_array, axis=(0, 1)).astype(int)
+    return tuple(avg_color)
+
+def attach_zone_colors_to_image(image: np.ndarray, zones: Dict[str, List[Tuple[int, int, int]]]) -> np.ndarray:
+    """Attach the average zone colors to the image for visualization."""
+    height, width = image.shape[:2]
+    output_image = np.array(image, copy=True)
+
+    corner_height = ZONE_SIZE + (height % ZONE_SIZE // 2)
+    corner_width = ZONE_SIZE + (width % ZONE_SIZE // 2)
+
+    # Draw the average color of each zone on the image
+    for zone_name, zone_colors in zones.items():
+        for idx, zone_color in enumerate(zone_colors):
+            if zone_name == "top_left_corner":
+                draw_square_on_image(output_image, (0, 0), (corner_width, corner_height), zone_color)
+            elif zone_name == "top_right_corner":
+                draw_square_on_image(output_image, (width - corner_width, 0), (width, corner_height), zone_color)
+            elif zone_name == "bottom_left_corner":
+                draw_square_on_image(output_image, (0, height - corner_height), (corner_width, height), zone_color)
+            elif zone_name == "bottom_right_corner":
+                draw_square_on_image(output_image, (width - corner_width, height - corner_height), (width, height), zone_color)
+            elif zone_name == "top_row":
+                x0 = corner_width + (idx * ZONE_SIZE)
+                x1 = min(corner_width + ((idx + 1) * ZONE_SIZE), width - corner_width)
+                draw_square_on_image(output_image, (x0, 0), (x1, ZONE_SIZE), zone_color)
+            elif zone_name == "bottom_row":
+                x0 = corner_width + (idx * ZONE_SIZE)
+                x1 = min(corner_width + ((idx + 1) * ZONE_SIZE), width - corner_width)
+                draw_square_on_image(output_image, (x0, height - ZONE_SIZE), (x1, height), zone_color)
+            elif zone_name == "left_column":
+                y0 = corner_height + (idx * ZONE_SIZE)
+                y1 = min(corner_height + ((idx + 1) * ZONE_SIZE), height - corner_height)
+                draw_square_on_image(output_image, (0, y0), (ZONE_SIZE, y1), zone_color)
+            elif zone_name == "right_column":
+                y0 = corner_height + (idx * ZONE_SIZE)
+                y1 = min(corner_height + ((idx + 1) * ZONE_SIZE), height - corner_height)
+                draw_square_on_image(output_image, (width - ZONE_SIZE, y0), (width, y1), zone_color)
+
+    return output_image
+
+def process_zones(zones: Dict[str, List[np.ndarray]]) -> Dict[str, List[Tuple[int, int, int]]]:
+    """Process the zone arrays to compute average colors for each zone."""
+    processed_zones = {}
+    for zone_name, zone_arrays in zones.items():
+        processed_zones[zone_name] = [compute_average_zone_color(zone_array) for zone_array in zone_arrays]
+    print(f"Processed zones: {processed_zones}")
+    return processed_zones
 
 def process_image(image_path, output_path):
     """Process an image frame into LED border colors and save a preview image.
@@ -207,28 +317,55 @@ def process_image(image_path, output_path):
     destination = Path(output_path)
 
     image = Image.open(source).convert("RGB")
-    rgb_array = np.asarray(image)
-    zone_colors = _compute_zone_colors(rgb_array, DEFAULT_LAYOUT)
-    zone_colors = _smooth_zone_colors(zone_colors)
+    rgb_array = np.array(np.asarray(image), copy=True)
 
-    output_dir = destination.parent
-    output_dir.mkdir(parents=True, exist_ok=True)
+    num_x_zones = (rgb_array.shape[1] - 2 * ZONE_SIZE) // ZONE_SIZE  # Example: 20 pixels per zone
+    num_y_zones = (rgb_array.shape[0] - 2 * ZONE_SIZE) // ZONE_SIZE  # Example: 20 pixels per zone
 
-    _save_zone_preview(destination, rgb_array, zone_colors, DEFAULT_LAYOUT)
+    zone_arrays = get_zone_arrays(rgb_array, num_x_zones=num_x_zones, num_y_zones=num_y_zones)
+    zone_colors = process_zones(zone_arrays)
 
-    return {
-        "layout": DEFAULT_LAYOUT,
-        "zones": zone_colors,
-        "output_path": str(destination),
-    }
+    attached_image = attach_zone_colors_to_image(rgb_array, zone_colors)
+    output_image(attached_image, destination)
+
+    # image = draw_outline_zones_on_image(rgb_array, num_x_zones=num_x_zones, num_y_zones=num_y_zones)
+    # output_image(image, destination)
+    
+    # output_zones(zone_colors, "images/output/zones")
+    # print(f"Zone arrays: {zone_arrays}")
+    # print(f"Zone colors: {zone_colors}")
+
+    # get_zones(rgb_array)
+
+    # extracted_array = extract_from_array(rgb_array, (2, 2), (100, 100))
+    # print(f"Extracted array shape: {extracted_array.shape}")
+    # print(f"Extracted array:\n{extracted_array}")
+
+    # draw_zones_on_image(rgb_array, num_x_zones=40, num_y_zones=45)
+
+    # print(rgb_array.shape)
+    # image_width, image_height = get_image_dimensions(image_path)
+    # print(f"Image dimensions: {image_width}x{image_height}")
+    # zone_colors = _compute_zone_colors(rgb_array, DEFAULT_LAYOUT)
+    # zone_colors = _smooth_zone_colors(zone_colors)
+
+    # output_dir = destination.parent
+    # output_dir.mkdir(parents=True, exist_ok=True)
+
+    # _save_zone_preview(destination, rgb_array, zone_colors, DEFAULT_LAYOUT)
+
+    # return {
+    #     "layout": DEFAULT_LAYOUT,
+    #     "zones": zone_colors,
+    #     "output_path": str(destination),
+    # }
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process an image for LED border color sampling.")
     parser.add_argument("image_path", help="Input image to process")
-    parser.add_argument("output_path", help="Output preview image path")
     args = parser.parse_args()
 
-    result = process_image(args.image_path, args.output_path)
-    print(f"Processed image: {result['output_path']}")
-    print(f"Top zones: {len(result['zones']['top'])}, Left zones: {len(result['zones']['left'])}, Right zones: {len(result['zones']['right'])}, Bottom zones: {len(result['zones']['bottom'])}")
+    result = process_image(f"images/input/{args.image_path}", f"images/output/output_{args.image_path}")
+    # print(f"Processed image: {result['output_path']}")
+    # print(f"Top zones: {len(result['zones']['top'])}, Left zones: {len(result['zones']['left'])}, Right zones: {len(result['zones']['right'])}, Bottom zones: {len(result['zones']['bottom'])}")
